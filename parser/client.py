@@ -9,7 +9,6 @@ from typing import List
 
 import requests
 
-BASE_URL = "https://api.hh.ru/vacancies"
 RSS_URL = "https://hh.ru/search/vacancy/rss"
 HH_UA_PATTERN = re.compile(r"^[\w.\-]+ \([^\s@]+@[^\s@]+\.[^\s@]+\)$")
 
@@ -36,7 +35,7 @@ def build_headers() -> dict:
     return {
         "User-Agent": hh_user_agent,
         "HH-User-Agent": hh_user_agent,
-        "Accept": "application/json",
+        "Accept": "application/xml",
         "X-Request-Id": str(uuid.uuid4()),
     }
 
@@ -53,6 +52,29 @@ def strip_html(text: str) -> str:
     cleaned = unescape(cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
+
+
+def parse_description(html: str) -> dict:
+    """Извлекает структурированные поля из HTML-описания RSS-элемента."""
+    text = strip_html(html)
+
+    employer = None
+    region = None
+    salary = None
+
+    m = re.search(r"Вакансия компании:\s*(.+?)(?:\s+Создана:|$)", text)
+    if m:
+        employer = m.group(1).strip()
+
+    m = re.search(r"Регион:\s*(.+?)(?:\s+Предполагаемый|$)", text)
+    if m:
+        region = m.group(1).strip()
+
+    m = re.search(r"Предполагаемый уровень месячного дохода:\s*(.+?)$", text)
+    if m:
+        salary = m.group(1).strip()
+
+    return {"employer": employer, "region": region, "salary": salary}
 
 
 def request_with_retries(
@@ -110,33 +132,21 @@ def parse_rss_items(xml_text: str, per_page: int) -> List[dict]:
             except (TypeError, ValueError):
                 published_at = pub_date_raw
 
+        parsed = parse_description(description_raw)
+
         items.append(
             {
                 "id": link or title,
                 "name": title,
                 "alternate_url": link,
                 "published_at": published_at,
-                "vacancy_text": strip_html(description_raw),
+                "employer": parsed["employer"],
+                "region": parsed["region"],
+                "salary": parsed["salary"],
             }
         )
 
     return items
-
-
-def fetch_via_rss(session: requests.Session, text: str, area: int, per_page: int, page: int) -> dict:
-    params = {"text": text, "area": area, "page": page}
-    response = request_with_retries(session, RSS_URL, params, max_attempts=3, backoff_seconds=1.0)
-    response.raise_for_status()
-
-    items = parse_rss_items(response.text, per_page=per_page)
-    return {
-        "_source": "hh_rss_fallback",
-        "found": len(items),
-        "pages": 1 if items else 0,
-        "page": page,
-        "per_page": per_page,
-        "items": items,
-    }
 
 
 def fetch_vacancies(
@@ -145,41 +155,18 @@ def fetch_vacancies(
     per_page: int = 20,
     page: int = 0,
 ) -> dict:
-    params = {
-        "text": text,
-        "area": area,
-        "per_page": per_page,
-        "page": page,
-    }
+    params = {"text": text, "area": area, "page": page}
 
     use_no_proxy = os.getenv("HH_NO_PROXY", "").strip() == "1"
     session = create_session(trust_env=not use_no_proxy)
 
-    response = request_with_retries(session, BASE_URL, params)
-
-    if response.status_code == 403:
-        return fetch_via_rss(session, text=text, area=area, per_page=per_page, page=page)
-
+    response = request_with_retries(session, RSS_URL, params, max_attempts=3, backoff_seconds=1.0)
     response.raise_for_status()
-    data = response.json()
 
-    normalized_items = []
-    for item in data.get("items", []):
-        normalized_items.append(
-            {
-                "id": item.get("id"),
-                "name": item.get("name"),
-                "alternate_url": item.get("alternate_url"),
-                "published_at": item.get("published_at"),
-                "vacancy_text": strip_html(((item.get("snippet") or {}).get("responsibility") or "")),
-            }
-        )
-
+    items = parse_rss_items(response.text, per_page=per_page)
     return {
-        "_source": "hh_api",
-        "found": data.get("found", 0),
-        "pages": data.get("pages", 0),
-        "page": data.get("page", page),
-        "per_page": data.get("per_page", per_page),
-        "items": normalized_items,
+        "found": len(items),
+        "page": page,
+        "per_page": per_page,
+        "items": items,
     }
